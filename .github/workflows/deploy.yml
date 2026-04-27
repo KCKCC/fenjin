@@ -3,6 +3,7 @@ name: Deploy to GitHub Pages
 on:
   push:
     branches: ["main"] # 當 main 分支有更新時觸發
+  workflow_dispatch:  # 👈 加入這一行，開啟手動開關
 
 permissions:
   contents: read
