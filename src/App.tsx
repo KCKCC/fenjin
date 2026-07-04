@@ -1,407 +1,260 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
-import Toolbar from '@/components/Toolbar';
-import EditorCanvas from '@/components/EditorCanvas';
-import LayersPanel from '@/components/LayersPanel';
-import { type LiquifyOptions } from '@/utils/liquify';
-import type { EditorCommand, EditorStatus, EditorTool } from '@/types/editor';
+import { useEffect, useRef, useState } from "react";
+import { useEditor, PAGE_SIZES } from "./useEditor";
+import { Canvas, type CanvasHandle } from "./components/Canvas";
+import { Inspector } from "./components/Inspector";
+import { exportSvgToPng } from "./utils/exportImage";
+import { clamp } from "./utils/geometry";
+import { LayoutPicker } from "./components/LayoutPicker";
+import type { BubbleKind } from "./types";
 
-const initialStatus: EditorStatus = {
-  historyIndex: 0,
-  historyLength: 0,
-  activeLayerId: null,
-  layers: [],
-};
+const BUBBLE_TYPES: { kind: BubbleKind; label: string; icon: string }[] = [
+  { kind: "speech", label: "對話", icon: "💬" },
+  { kind: "thought", label: "想法", icon: "💭" },
+  { kind: "shout", label: "吶喊", icon: "💥" },
+  { kind: "narration", label: "旁白", icon: "▭" },
+  { kind: "none", label: "純文字", icon: "T" },
+];
 
-function App() {
-  const [image, setImage] = useState<HTMLImageElement | null>(null);
-  const [tool, setTool] = useState<EditorTool>('push');
-  const [brushSize, setBrushSize] = useState(36);
-  const [pressure, setPressure] = useState(0.4);
-  const [paintColor, setPaintColor] = useState('#7c3aed');
-  const [paintOpacity, setPaintOpacity] = useState(0.85);
-  const [brushHardness, setBrushHardness] = useState(0.5);
-  const [isDragging, setIsDragging] = useState(false);
-  const [showOriginal, setShowOriginal] = useState(false);
-  const [editorStatus, setEditorStatus] = useState<EditorStatus>(initialStatus);
-  const [editorCommand, setEditorCommand] = useState<EditorCommand>({ type: 'none', nonce: 0 });
-  const [liquifyOptions, setLiquifyOptions] = useState<LiquifyOptions>({
-    interpolation: 'bicubic',
-    brushHardness: 0.18,
-    sharpenAmount: 0.12,
-  });
+export default function App() {
+  const ed = useEditor();
+  const canvasRef = useRef<CanvasHandle>(null);
+  const [scale, setScale] = useState(0.62);
+  const [exporting, setExporting] = useState(false);
+  const [layoutOpen, setLayoutOpen] = useState(false);
 
-  const fileInputRef = useRef<HTMLInputElement>(null);
-  const nonceRef = useRef(0);
+  const selPanel =
+    ed.selection?.type === "panel"
+      ? ed.state.panels.find((p) => p.id === ed.selection!.id)
+      : undefined;
+  const selBubble =
+    ed.selection?.type === "bubble"
+      ? ed.state.bubbles.find((b) => b.id === ed.selection!.id)
+      : undefined;
 
-  const dispatchCommand = useCallback((command: { type: EditorCommand['type']; [key: string]: unknown }) => {
-    nonceRef.current += 1;
-    setEditorCommand({ ...command, nonce: nonceRef.current } as EditorCommand);
-  }, []);
-
-  const loadImage = useCallback((file: File) => {
-    if (!file.type.startsWith('image/')) return;
-
-    const url = URL.createObjectURL(file);
-    const img = new Image();
-    img.onload = () => {
-      setImage(img);
-      setEditorStatus(initialStatus);
-    };
-    img.src = url;
-  }, []);
-
-  const handleFileChange = useCallback((event: React.ChangeEvent<HTMLInputElement>) => {
-    const file = event.target.files?.[0];
-    if (file) loadImage(file);
-  }, [loadImage]);
-
-  const handleDrop = useCallback((event: React.DragEvent) => {
-    event.preventDefault();
-    setIsDragging(false);
-    const file = event.dataTransfer.files?.[0];
-    if (file) loadImage(file);
-  }, [loadImage]);
-
-  const handleDragOver = useCallback((event: React.DragEvent) => {
-    event.preventDefault();
-    setIsDragging(true);
-  }, []);
-
-  const handleDragLeave = useCallback(() => {
-    setIsDragging(false);
-  }, []);
-
-  const handleDownload = useCallback(() => {
-    (window as any).__editorDownload?.();
-  }, []);
-
+  // Prevent global browser drop (opening image in new window)
   useEffect(() => {
-    (window as any).__editorDispatch = dispatchCommand;
+    const preventGlobalDrop = (e: DragEvent) => {
+      e.preventDefault();
+    };
+    window.addEventListener("dragover", preventGlobalDrop, false);
+    window.addEventListener("drop", preventGlobalDrop, false);
     return () => {
-      delete (window as any).__editorDispatch;
+      window.removeEventListener("dragover", preventGlobalDrop, false);
+      window.removeEventListener("drop", preventGlobalDrop, false);
     };
-  }, [dispatchCommand]);
-
-  const handleKeyDown = useCallback((event: React.KeyboardEvent<HTMLDivElement>) => {
-    if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'z') {
-      event.preventDefault();
-      if (event.shiftKey) {
-        dispatchCommand({ type: 'redo' });
-      } else {
-        dispatchCommand({ type: 'undo' });
-      }
-      return;
-    }
-
-    if (event.key === ' ') {
-      event.preventDefault();
-      setShowOriginal(true);
-    }
-
-    if (event.key.toLowerCase() === 'b') {
-      setTool('brush');
-    }
-
-    if (event.key.toLowerCase() === 'e') {
-      setTool('eraser');
-    }
-
-    if (event.key.toLowerCase() === 't') {
-      setTool('transform');
-    }
-
-    // 注意：Ctrl+V 由 document-level 'paste' 事件處理（更可靠，不需焦點）
-  }, [dispatchCommand]);
-
-  const handleKeyUp = useCallback((event: React.KeyboardEvent<HTMLDivElement>) => {
-    if (event.key === ' ') {
-      setShowOriginal(false);
-    }
   }, []);
 
-  // 處理檔案 → 新圖層 (用於拖入或貼上)
-  const addImageAsLayer = useCallback((file: File) => {
-    if (!file.type.startsWith('image/')) return;
-    const url = URL.createObjectURL(file);
-    const img = new Image();
-    img.onload = () => {
-      const canvas = document.createElement('canvas');
-      canvas.width = img.width;
-      canvas.height = img.height;
-      const ctx = canvas.getContext('2d')!;
-      ctx.drawImage(img, 0, 0);
-      const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
-      dispatchCommand({ type: 'paste-image', imageData });
-      URL.revokeObjectURL(url);
-    };
-    img.src = url;
-  }, [dispatchCommand]);
-
-  // Document-level paste listener (確保任何狀態下都能貼上)
+  // keyboard shortcuts
   useEffect(() => {
-    if (!image) return;
-
-    const handleDocPaste = (e: ClipboardEvent) => {
-      const items = e.clipboardData?.items;
-      if (!items) return;
-      for (const item of items) {
-        if (item.type.startsWith('image/')) {
-          const file = item.getAsFile();
-          if (file) {
-            e.preventDefault();
-            addImageAsLayer(file);
-            return;
-          }
-        }
+    const handler = (e: KeyboardEvent) => {
+      const target = e.target as HTMLElement;
+      const typing =
+        target.tagName === "INPUT" ||
+        target.tagName === "TEXTAREA" ||
+        target.isContentEditable;
+      if (typing) return;
+      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "z") {
+        e.preventDefault();
+        if (e.shiftKey) ed.redo();
+        else ed.undo();
+      } else if ((e.key === "Delete" || e.key === "Backspace") && ed.selection) {
+        e.preventDefault();
+        ed.deleteSelected();
+      } else if (e.key === "Escape") {
+        ed.setSelection(null);
       }
     };
+    window.addEventListener("keydown", handler);
+    return () => window.removeEventListener("keydown", handler);
+  }, [ed]);
 
-    document.addEventListener('paste', handleDocPaste);
-    return () => document.removeEventListener('paste', handleDocPaste);
-  }, [addImageAsLayer, image]);
-
-  // 全域 paste 監聽（已上傳圖片後）
-  const handlePaste = useCallback((event: React.ClipboardEvent<HTMLDivElement>) => {
-    if (!image) return;
-    const items = event.clipboardData?.items;
-    if (!items) return;
-    for (const item of items) {
-      if (item.type.startsWith('image/')) {
-        const file = item.getAsFile();
-        if (file) {
-          event.preventDefault();
-          addImageAsLayer(file);
-          return;
-        }
-      }
+  const handleExport = async () => {
+    const svg = canvasRef.current?.getSvg();
+    if (!svg) return;
+    setExporting(true);
+    ed.setSelection(null);
+    await new Promise((r) => setTimeout(r, 60));
+    try {
+      await exportSvgToPng(svg, ed.state.page.width, ed.state.page.height, 2);
+    } finally {
+      setExporting(false);
     }
-  }, [addImageAsLayer, image]);
-
-  // 拖入圖片 → 新圖層 (已有 image 時) 或 → 開啟為基底 (尚未上傳時)
-  const handleEditorDrop = useCallback((event: React.DragEvent<HTMLDivElement>) => {
-    event.preventDefault();
-    setIsDragging(false);
-    const file = event.dataTransfer.files?.[0];
-    if (!file || !file.type.startsWith('image/')) return;
-    if (image) {
-      addImageAsLayer(file);
-    } else {
-      loadImage(file);
-    }
-  }, [addImageAsLayer, image, loadImage]);
-
-  const handleEditorDragOver = useCallback((event: React.DragEvent<HTMLDivElement>) => {
-    event.preventDefault();
-    setIsDragging(true);
-  }, []);
-
-  const handleEditorDragLeave = useCallback((event: React.DragEvent<HTMLDivElement>) => {
-    // 只在離開最外層時才取消
-    if (event.currentTarget === event.target) {
-      setIsDragging(false);
-    }
-  }, []);
-
-  const hasImage = !!image;
-  const activeLayer = editorStatus.layers.find((layer) => layer.id === editorStatus.activeLayerId) ?? null;
+  };
 
   return (
-    <div
-      className="flex min-h-screen flex-col bg-[radial-gradient(circle_at_top,_#eef2ff,_#f8fafc_35%,_#f1f5f9_100%)]"
-      onKeyDown={handleKeyDown}
-      onKeyUp={handleKeyUp}
-      onPaste={handlePaste}
-      onDrop={handleEditorDrop}
-      onDragOver={handleEditorDragOver}
-      onDragLeave={handleEditorDragLeave}
-      tabIndex={0}
-    >
-      <header className="border-b border-slate-200/70 bg-white/85 px-6 py-3 backdrop-blur-sm">
-        <div className="flex flex-wrap items-center justify-between gap-4">
-          <div className="flex items-center gap-3">
-            <div className="flex h-11 w-11 items-center justify-center rounded-2xl bg-gradient-to-br from-indigo-500 via-indigo-600 to-purple-600 text-sm font-black text-white shadow-lg shadow-indigo-200">
-              LQ
-            </div>
-            <div>
-              <h1 className="text-lg font-bold text-slate-900">Liquify Studio Pro</h1>
-              <p className="text-xs text-slate-500">液化、圖層、畫筆與橡皮擦整合的線上繪圖工作台</p>
-            </div>
-            <span className="rounded-full border border-indigo-200 bg-indigo-50 px-2.5 py-1 text-[10px] font-semibold text-indigo-600">
-              Layer + Brush Upgrade
+    <div className="relative flex h-screen flex-col overflow-hidden bg-zinc-950 text-zinc-100">
+      <LayoutPicker
+        open={layoutOpen}
+        onClose={() => setLayoutOpen(false)}
+        onPick={(t) => ed.applyLayout(t)}
+      />
+      {/* Top bar */}
+      <header className="flex items-center gap-3 border-b border-zinc-800 bg-zinc-900 px-4 py-2.5">
+        <div className="flex items-center gap-2">
+          <span className="text-lg">📐</span>
+          <span className="text-sm font-bold tracking-wide">MangaFrame</span>
+          <span className="hidden text-[11px] text-zinc-500 sm:inline">漫畫分鏡工具</span>
+        </div>
+
+        <div className="mx-2 h-5 w-px bg-zinc-700" />
+
+        <button
+          onClick={ed.addPanel}
+          className="rounded-md bg-indigo-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-indigo-500"
+        >
+          ＋ 新增分鏡
+        </button>
+
+        <div className="flex items-center gap-1 rounded-md bg-zinc-800 p-1">
+          {BUBBLE_TYPES.map((b) => (
+            <button
+              key={b.kind}
+              onClick={() => ed.addBubble(b.kind)}
+              title={`新增${b.label}`}
+              className="flex items-center gap-1 rounded px-2 py-1 text-xs text-zinc-200 hover:bg-zinc-700"
+            >
+              <span>{b.icon}</span>
+              <span className="hidden md:inline">{b.label}</span>
+            </button>
+          ))}
+        </div>
+
+        <div className="mx-1 h-5 w-px bg-zinc-700" />
+
+        <button
+          onClick={ed.undo}
+          disabled={!ed.canUndo}
+          className="rounded-md px-2 py-1.5 text-xs text-zinc-300 hover:bg-zinc-800 disabled:opacity-30"
+          title="復原 (Ctrl+Z)"
+        >
+          ↶ 復原
+        </button>
+        <button
+          onClick={ed.redo}
+          disabled={!ed.canRedo}
+          className="rounded-md px-2 py-1.5 text-xs text-zinc-300 hover:bg-zinc-800 disabled:opacity-30"
+          title="重做 (Ctrl+Shift+Z)"
+        >
+          ↷ 重做
+        </button>
+
+        <div className="ml-auto flex items-center gap-3">
+          <select
+            value={ed.state.page.name}
+            onChange={(e) => {
+              const p = PAGE_SIZES.find((x) => x.name === e.target.value);
+              if (p) ed.setPage(p);
+            }}
+            className="rounded-md border border-zinc-700 bg-zinc-800 px-2 py-1 text-xs text-zinc-100 outline-none"
+          >
+            {PAGE_SIZES.map((p) => (
+              <option key={p.name} value={p.name}>
+                {p.name}
+              </option>
+            ))}
+          </select>
+
+          <div className="flex items-center gap-1 text-xs text-zinc-400">
+            <button
+              onClick={() => setScale((s) => clamp(s - 0.1, 0.2, 2))}
+              className="h-6 w-6 rounded bg-zinc-800 hover:bg-zinc-700"
+            >
+              −
+            </button>
+            <span className="w-10 text-center tabular-nums">
+              {Math.round(scale * 100)}%
             </span>
+            <button
+              onClick={() => setScale((s) => clamp(s + 0.1, 0.2, 2))}
+              className="h-6 w-6 rounded bg-zinc-800 hover:bg-zinc-700"
+            >
+              ＋
+            </button>
           </div>
 
-          <div className="flex flex-wrap items-center gap-2">
-            <label className="flex cursor-pointer items-center gap-2 rounded-xl bg-indigo-600 px-4 py-2 text-xs font-semibold text-white shadow-sm transition hover:bg-indigo-700">
-              📁 上傳圖片
-              <input
-                ref={fileInputRef}
-                type="file"
-                accept="image/*"
-                onChange={handleFileChange}
-                className="hidden"
-              />
-            </label>
-            <button
-              onClick={() => dispatchCommand({ type: 'add-layer' })}
-              disabled={!hasImage}
-              className="rounded-xl border border-slate-200 bg-white px-4 py-2 text-xs font-semibold text-slate-700 shadow-sm transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-40"
-            >
-              ＋ 新增圖層
-            </button>
-            <button
-              onClick={handleDownload}
-              disabled={!hasImage}
-              className="rounded-xl bg-emerald-600 px-4 py-2 text-xs font-semibold text-white shadow-sm transition hover:bg-emerald-700 disabled:cursor-not-allowed disabled:opacity-40"
-            >
-              💾 下載結果
-            </button>
-          </div>
+          <button
+            onClick={() => setLayoutOpen((v) => !v)}
+            className="flex items-center gap-1.5 rounded-md bg-zinc-800 px-3 py-1.5 text-xs text-zinc-200 hover:bg-zinc-700"
+          >
+            <span>▦</span> 版型
+          </button>
+          <button
+            onClick={handleExport}
+            disabled={exporting}
+            className="rounded-md bg-emerald-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-emerald-500 disabled:opacity-50"
+          >
+            {exporting ? "匯出中…" : "⬇ 匯出 PNG"}
+          </button>
         </div>
       </header>
 
-      <div className="px-6 py-3">
-        <Toolbar
-          tool={tool}
-          onToolChange={setTool}
-          brushSize={brushSize}
-          onBrushSizeChange={setBrushSize}
-          pressure={pressure}
-          onPressureChange={setPressure}
-          paintColor={paintColor}
-          onPaintColorChange={setPaintColor}
-          paintOpacity={paintOpacity}
-          onPaintOpacityChange={setPaintOpacity}
-          canUndo={editorStatus.historyIndex > 0}
-          canRedo={editorStatus.historyIndex < editorStatus.historyLength - 1}
-          onUndo={() => dispatchCommand({ type: 'undo' })}
-          onRedo={() => dispatchCommand({ type: 'redo' })}
-          onReset={() => dispatchCommand({ type: 'reset' })}
-          hasImage={hasImage}
-          options={liquifyOptions}
-          brushHardness={brushHardness}
-          onBrushHardnessChange={setBrushHardness}
-          onFlattenLayer={() => dispatchCommand({ type: 'flatten-layer' })}
-          onOptionsChange={setLiquifyOptions}
-        />
+      <div className="flex min-h-0 flex-1">
+        {/* Canvas area */}
+        <main
+          className="relative flex-1 overflow-auto p-10"
+          style={{
+            backgroundImage:
+              "radial-gradient(circle, #27272a 1px, transparent 1px)",
+            backgroundSize: "22px 22px",
+          }}
+          onPointerDown={(e) => {
+            if (e.currentTarget === e.target) ed.setSelection(null);
+          }}
+        >
+          <Canvas
+            ref={canvasRef}
+            state={ed.state}
+            selection={ed.selection}
+            scale={scale}
+            setSelection={ed.setSelection}
+            beginDrag={ed.beginDrag}
+            endDrag={ed.endDrag}
+            updatePanel={ed.updatePanel}
+            updateBubble={ed.updateBubble}
+          />
+        </main>
+
+        {/* Right inspector */}
+        <aside className="w-72 shrink-0 overflow-y-auto border-l border-zinc-800 bg-zinc-900">
+          <div className="border-b border-zinc-800 px-4 py-2.5">
+            <h2 className="text-sm font-semibold text-zinc-200">屬性面板</h2>
+          </div>
+          <Inspector
+            selection={ed.selection}
+            panel={selPanel}
+            bubble={selBubble}
+            onUpdatePanel={(patch) =>
+              selPanel && ed.updatePanel(selPanel.id, patch)
+            }
+            onUpdateBubble={(patch) =>
+              selBubble && ed.updateBubble(selBubble.id, patch)
+            }
+            onDelete={ed.deleteSelected}
+            onBringFront={ed.bringToFront}
+            onRemoveImage={() =>
+              selPanel && ed.updatePanel(selPanel.id, { image: null })
+            }
+          />
+
+          <div className="border-t border-zinc-800 p-4">
+            <div className="mb-2 flex items-center justify-between">
+              <span className="text-xs text-zinc-400">頁面底色</span>
+              <input
+                type="color"
+                value={ed.state.bg}
+                onChange={(e) => ed.setBg(e.target.value)}
+                className="h-7 w-9 cursor-pointer rounded border border-zinc-700 bg-transparent"
+              />
+            </div>
+            <button
+              onClick={ed.clearAll}
+              className="w-full rounded-md border border-zinc-700 px-3 py-1.5 text-xs text-zinc-400 hover:bg-zinc-800"
+            >
+              清空畫布
+            </button>
+          </div>
+        </aside>
       </div>
-
-      {/* 全局拖入提示 */}
-      {isDragging && image && (
-        <div className="pointer-events-none fixed inset-0 z-[200] flex items-center justify-center bg-indigo-500/20 backdrop-blur-sm">
-          <div className="rounded-3xl border-4 border-dashed border-indigo-500 bg-white/90 px-12 py-8 text-center shadow-2xl">
-            <div className="text-5xl">📥</div>
-            <p className="mt-3 text-xl font-bold text-indigo-700">放開以加入新圖層</p>
-            <p className="mt-1 text-sm text-slate-500">拖入的圖片將會建立成一個新的繪圖圖層</p>
-          </div>
-        </div>
-      )}
-
-      <main className="flex flex-1 gap-6 px-6 pb-6">
-        {!image ? (
-          <div
-            onDrop={handleDrop}
-            onDragOver={handleDragOver}
-            onDragLeave={handleDragLeave}
-            onClick={() => fileInputRef.current?.click()}
-            className={`flex flex-1 cursor-pointer flex-col items-center justify-center rounded-[2rem] border-2 border-dashed transition ${
-              isDragging
-                ? 'border-indigo-400 bg-indigo-50/60'
-                : 'border-slate-300 bg-white/70 hover:border-indigo-300 hover:bg-indigo-50/40'
-            }`}
-          >
-            <div className="flex flex-col items-center gap-5 px-8 py-16 text-center">
-              <div className="flex h-24 w-24 items-center justify-center rounded-[2rem] bg-indigo-50 text-4xl shadow-inner">🖼️</div>
-              <div>
-                <p className="text-xl font-bold text-slate-800">建立你的液化與繪圖專案</p>
-                <p className="mt-2 text-sm text-slate-500">
-                  點擊上傳、拖入圖片，或直接按 <kbd className="rounded bg-slate-100 px-1.5 py-0.5 text-xs font-mono">Ctrl/Cmd + V</kbd> 貼上剪貼簿圖片
-                </p>
-              </div>
-              <div className="flex flex-wrap justify-center gap-2 text-xs text-slate-500">
-                <span className="rounded-full bg-white px-3 py-1 shadow-sm">Liquify</span>
-                <span className="rounded-full bg-white px-3 py-1 shadow-sm">Layers</span>
-                <span className="rounded-full bg-white px-3 py-1 shadow-sm">Brush</span>
-                <span className="rounded-full bg-white px-3 py-1 shadow-sm">Eraser</span>
-                <span className="rounded-full bg-white px-3 py-1 shadow-sm">PNG Export</span>
-              </div>
-            </div>
-          </div>
-        ) : (
-          <>
-            <section className="flex min-w-0 flex-1 flex-col gap-3">
-              <div className="flex flex-wrap items-center gap-2 text-[11px] text-slate-500">
-                <span className="rounded-full bg-white px-3 py-1 shadow-sm">Ctrl/Cmd + Z 復原</span>
-                <span className="rounded-full bg-white px-3 py-1 shadow-sm">Shift + Ctrl/Cmd + Z 重做</span>
-                <span className="rounded-full bg-white px-3 py-1 shadow-sm">Space 顯示原始圖</span>
-                <span className="rounded-full bg-white px-3 py-1 shadow-sm">B 畫筆</span>
-                <span className="rounded-full bg-white px-3 py-1 shadow-sm">E 橡皮擦</span>
-              </div>
-
-              <EditorCanvas
-                image={image}
-                tool={tool}
-                brushSize={brushSize}
-                pressure={pressure}
-                brushHardness={brushHardness}
-                paintColor={paintColor}
-                paintOpacity={paintOpacity}
-                showOriginal={showOriginal}
-                options={liquifyOptions}
-                command={editorCommand}
-                onStatusChange={setEditorStatus}
-              />
-            </section>
-
-            <div className="flex w-full max-w-sm flex-col gap-4">
-              <div className="rounded-2xl border border-slate-200 bg-white/90 p-4 shadow-lg backdrop-blur-sm">
-                <h2 className="text-sm font-bold text-slate-800">目前工作狀態</h2>
-                <div className="mt-3 grid grid-cols-2 gap-3 text-xs">
-                  <div className="rounded-xl bg-slate-50 p-3">
-                    <p className="text-slate-500">工具</p>
-                    <p className="mt-1 font-semibold text-slate-800">{tool}</p>
-                  </div>
-                  <div className="rounded-xl bg-slate-50 p-3">
-                    <p className="text-slate-500">圖層</p>
-                    <p className="mt-1 font-semibold text-slate-800">{editorStatus.layers.length}</p>
-                  </div>
-                  <div className="rounded-xl bg-slate-50 p-3">
-                    <p className="text-slate-500">選取圖層</p>
-                    <p className="mt-1 truncate font-semibold text-slate-800">{activeLayer?.name ?? '—'}</p>
-                  </div>
-                  <div className="rounded-xl bg-slate-50 p-3">
-                    <p className="text-slate-500">歷史</p>
-                    <p className="mt-1 font-semibold text-slate-800">
-                      {editorStatus.historyLength === 0 ? '0/0' : `${editorStatus.historyIndex + 1}/${editorStatus.historyLength}`}
-                    </p>
-                  </div>
-                </div>
-              </div>
-
-              <LayersPanel
-                layers={editorStatus.layers}
-                activeLayerId={editorStatus.activeLayerId}
-                onSelectLayer={(layerId) => dispatchCommand({ type: 'select-layer', layerId })}
-                onAddLayer={() => dispatchCommand({ type: 'add-layer' })}
-                onDuplicateLayer={() => dispatchCommand({ type: 'duplicate-layer' })}
-                onDeleteLayer={() => dispatchCommand({ type: 'delete-layer' })}
-                onMoveLayerUp={() => dispatchCommand({ type: 'move-layer-up' })}
-                onMoveLayerDown={() => dispatchCommand({ type: 'move-layer-down' })}
-                onToggleLayerVisibility={(layerId) => dispatchCommand({ type: 'toggle-layer-visibility', layerId })}
-                onSetLayerOpacity={(layerId, opacity) => dispatchCommand({ type: 'set-layer-opacity', layerId, opacity })}
-                onSetLayerTransform={(layerId, transform) => dispatchCommand({ type: 'set-layer-transform', layerId, transform })}
-                onResetLayerTransform={(layerId) => dispatchCommand({ type: 'reset-layer-transform', layerId })}
-              />
-            </div>
-          </>
-        )}
-      </main>
-
-      <footer className="border-t border-slate-200/70 bg-white/70 px-6 py-3 text-center text-[11px] text-slate-500 backdrop-blur-sm">
-        保留原有液化功能，並新增圖層、畫筆、橡皮擦、圖層透明度、圖層排序與非破壞式繪圖流程。
-      </footer>
     </div>
   );
 }
-
-export default App;
