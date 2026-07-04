@@ -5,6 +5,10 @@ on:
     branches: ["main"] # 當 main 分支有更新時觸發
   workflow_dispatch:  # 👈 加入這一行，開啟手動開關
 
+# 全域環境變數，消除兩類警告
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
 permissions:
   contents: read
   pages: write
@@ -24,7 +28,7 @@ jobs:
           cache: 'npm'
 
       - name: Install dependencies
-        run: npm install
+        run: npm ci
 
       - name: Build
         run: npm run build
